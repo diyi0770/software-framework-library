@@ -4,26 +4,10 @@
 
 
 
-#ifndef TASK_MAX_SUSPEND_CNT
-#error "TASK_MAX_SUSPEND_CNT undefined"
-#elif (TASK_MAX_SUSPEND_CNT < 1) || (TASK_MAX_SUSPEND_CNT >= ~0U)
-#error "TASK_MAX_SUSPEND_CNT can't be less than 1"
+#if (TASK_MAX_SUSPEND_CNT < 1) || (TASK_MAX_SUSPEND_CNT >= ~0U)
+#error "TASK_MAX_SUSPEND_CNT is [1, 65535)"
 #endif
 
-
-// #include <fcntl.h>
-// #include <unistd.h>
-// #include <sys/select.h>
-// #include <sys/types.h>
-// #include <sys/stat.h>
-// #include <sys/time.h>
-
-// #if defined(TASK_MUTEX_DEFAULT)
-// #elif defined(TASK_MUTEX_PTHREAD)
-//     pthread_mutex_destroy(&g_mutex);
-// #elif defined(TASK_MUTEX_SPINLOCK)
-//     pthread_spin_destroy(&g_lock);
-// #endif
 
 
 /**
@@ -34,7 +18,6 @@
 #define     TASK_ENTER_CRITICAL()       do {(void*)0;} while(0)
 #define     TASK_EXIT_CRITICAL()        do {(void*)0;} while(0)
 #define     TASK_MUTEX_DESTROY()        (void*)0
-
 #elif defined(TASK_MUTEX_PTHREAD)
 #include <pthread.h>
 static pthread_mutex_t  g_mutex;
@@ -42,7 +25,6 @@ static pthread_mutex_t  g_mutex;
 #define     TASK_ENTER_CRITICAL()       pthread_mutex_lock(&g_mutex)
 #define     TASK_EXIT_CRITICAL()        pthread_mutex_unlock(&g_mutex)
 #define     TASK_MUTEX_DESTROY()        pthread_mutex_destroy(&g_mutex)
-
 #elif defined(TASK_MUTEX_SPINLOCK)
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200112L
@@ -66,7 +48,6 @@ static pthread_spinlock_t   g_lock;
 #define     TASK_SEM_WAIT()             do {(void*)0;} while(0)
 #define     TASK_SEM_POST()             do {(void*)0;} while(0)
 #define     TASK_SEM_DESTROY()          (void*)0
-
 #elif defined(TASK_SEM_POSIX)
 #include <semaphore.h>
 static sem_t    g_sem;
@@ -74,7 +55,6 @@ static sem_t    g_sem;
 #define     TASK_SEM_WAIT()             sem_wait(&g_sem)
 #define     TASK_SEM_POST()             sem_post(&g_sem)
 #define     TASK_SEM_DESTROY()          sem_destroy(&g_sem)
-
 #elif defined(TASK_SEM_SYSTEMV)
 #include <sys/types.h>
 #include <sys/ipc.h>
@@ -95,6 +75,8 @@ static struct sembuf g_semop_v = {.sem_op=+1, .sem_flg = SEM_UNDO};
 #define TASK_FLAG_FINISHED          (1U << 2)
 
 
+
+/* typedef ********************************************************************/
 
 /**
  * @brief 任务控制块 结构定义
@@ -119,9 +101,21 @@ typedef struct {
 
 
 
+/* global **********************************************************************/
+
+static int _task_queue_isempty(task_queue_t *queue);
+static int _task_queue_isfull(task_queue_t *queue);
+static void _task_queue_add(task_queue_t *queue, task_tcb_t item);
+static task_tcb_t _task_queue_get(task_queue_t *queue);
+static uint32_t _task_queue_level(task_queue_t *queue);
+
+
+
 static task_queue_t    g_task_queue;
 
 
+
+/* function *******************************************************************/
 
 /**
  * @brief 检查队列是否为空
@@ -188,7 +182,7 @@ static uint32_t _task_queue_level(task_queue_t *queue)
 
 
 /**
- * @brief 初始化任务队列
+ * @brief 初始化任务队列、互斥锁、信号量
  */
 void task_init(void)
 {
@@ -241,10 +235,10 @@ void task_schedule(void)
 
 /**
  * @brief 向任务队列添加任务
- * @param task 
- * @param arg 
- * @param cleanup 
- * @param flag 
+ * @param task 任务函数
+ * @param arg 传递给任务的数据
+ * @param cleanup 数据清理函数
+ * @param flag 任务状态
  * @return int 成功返回0，失败返回-1
  */
 int  task_add(void(*task)(void*), void* arg, void(*cleanup)(void*), uint8_t *flag)
@@ -305,7 +299,7 @@ void task_destroy(void)
 /**
  * @brief 检查flag是否被设置了挂起标志
  * @param flag 
- * @return int 
+ * @return int 设置了挂起返回True，未设置挂起返回False
  */
 int task_flag_is_suspending(uint8_t *flag)
 {
@@ -316,9 +310,22 @@ int task_flag_is_suspending(uint8_t *flag)
 
 
 /**
- * @brief 检查flag是否被设置了完成标志
+ * @brief 检查flag是否被设置了活跃标志
  * @param flag 
- * @return int 
+ * @return int 设置了活跃返回True，未设置则返回False
+ */
+int task_flag_is_active(uint8_t *flag)
+{
+    uint8_t tmpflag = *flag;
+    return ((tmpflag & TASK_FLAG_ACITVE) == TASK_FLAG_ACITVE);
+}
+
+
+
+/**
+ * @brief 检查flag是否被设置了执行完成标志
+ * @param flag 
+ * @return int 设置了执行完成返回True，未设置则返回False
  */
 int task_flag_is_finished(uint8_t *flag)
 {

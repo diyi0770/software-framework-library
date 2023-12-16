@@ -6,8 +6,7 @@
 /* 最大挂起任务数 */
 #define TASK_MAX_SUSPEND_CNT        32
 
-/* 初始化flag */
-#define TASK_FLAG_INITIALIZER       0U
+
 
 /* 互斥锁实现方式选择 */
 #define TASK_MUTEX_REALIZE          2
@@ -30,13 +29,19 @@
 #endif
 
 
+/* 初始化flag */
+#define TASK_FLAG_INITIALIZER       0U
+
+
+
 void task_init(void);
 void task_schedule(void);
 int  task_add(void(*task)(void*), void* arg, void(*cleanup)(void*), uint8_t *flag);
 void task_destroy(void);
 uint32_t task_getnum(void);
 
-int  task_flag_is_suspending(uint8_t *flag);
+int task_flag_is_suspending(uint8_t *flag);
+int task_flag_is_active(uint8_t *flag);
 int task_flag_is_finished(uint8_t *flag);
 
 #endif
