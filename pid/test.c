@@ -2,19 +2,21 @@
 #include "pid.h"
 
 
+
 int main()
 {
-    pid_t   pid;
-    // double  err;
+    pid2_t   pid;
+    long    i = 0;
     double  in = 100, out = 0;
     
-    pid_struct_init(&pid, 0.1, 0.01, 0.01);
+    pid_init2(&pid, 0.7, 3, 0.0001);
+    // pid_init(&pid, 0.7, 0, 0.2);
     
     do {
-        out = pid_discrete(&pid, in - out);
-        printf("%.8lf\n", out);
+        out = pid_diff_incremental(&pid, in - out, 1);
+        // out /= 2;
+        printf("%.8lf,%ld\n", out, ++i);
     } while (! (-0.000001 < (in - out) && (in - out) < 0.000001));
     
     return 0;
 }
-
