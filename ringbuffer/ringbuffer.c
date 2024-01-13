@@ -1,6 +1,16 @@
 #include "ringbuffer.h"
 
 
+
+/**
+ * @brief 定义handle的类型
+ */
+#ifndef DEV_HANDLE_T
+#error "please define the DEV_HANDLE_T used to specified the type that the handle pointer points to!"
+#endif
+
+
+
 /**
  * @brief 使能发送中断
  */
@@ -59,6 +69,23 @@
 
 
 #define DEV_STAT_TXIE          (1U << 0)
+
+
+
+struct _ring_buffer_t {
+    unsigned char   *data;
+    unsigned int    rd_i;
+    unsigned int    wr_i;
+    unsigned int    maxsize;
+};
+
+
+struct _ring_dev_t {
+    ring_buffer_t   tx_ring;
+    ring_buffer_t   rx_ring;
+    unsigned int    status;
+    DEV_HANDLE_T    *handle;
+};
 
 
 
@@ -211,15 +238,16 @@ void ring_dev_init(ring_dev_t *dev, void *handle, unsigned char *txdata, unsigne
 /**
  * @brief 设备发送数据, 优先以轮询方式发送, 当硬件FIFO已满打开发送中断进行发送
  * @param dev 句柄
- * @param data 要发送的数据
+ * @param sdata 要发送的数据
  * @param size 数据大小(byte)
  * @return unsigned int 返回成功发送地字节数
  * @author diyi12
  * @date 2024-01-10
  */
-unsigned int ring_dev_tx(ring_dev_t *dev, const unsigned char *data, unsigned int size)
+unsigned int ring_dev_tx(ring_dev_t *dev, void *sdata, unsigned int size)
 {
-    unsigned int    sdsize = 0;
+    unsigned int        sdsize = 0;
+    const unsigned char *data = (unsigned char *)sdata;
     
     /**
      * 没有打开发送中断时，优先使用硬件FIFO发送数据
@@ -289,15 +317,16 @@ unsigned int ring_dev_tx(ring_dev_t *dev, const unsigned char *data, unsigned in
  *          重新打开中断。注意, 当读取完指定的字节数后缓存仍为满时不会打开中断
  * 
  * @param dev 句柄
- * @param data 存放数据的起始地址
+ * @param rdata 存放数据的起始地址
  * @param size 需要接收的数据大小(byte)
  * @return unsigned int 返回成功接收的字节数
  * @author diyi12
  * @date 2024-01-10
  */
-unsigned int ring_dev_rx(ring_dev_t *dev, unsigned char *data, unsigned int size)
+unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
 {
     unsigned int    rvsize = 0;
+    unsigned char   *data = (unsigned char *)rdata;
     
     /**
      * 优先从接收缓存区中读取数据
