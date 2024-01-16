@@ -72,23 +72,6 @@
 
 
 
-struct _ring_buffer_t {
-    unsigned char   *data;
-    unsigned int    rd_i;
-    unsigned int    wr_i;
-    unsigned int    maxsize;
-};
-
-
-struct _ring_dev_t {
-    ring_buffer_t   tx_ring;
-    ring_buffer_t   rx_ring;
-    unsigned int    status;
-    DEV_HANDLE_T    *handle;
-};
-
-
-
 static inline int _is_empty(ring_buffer_t *ring)
 {
     return (ring->rd_i == ring->wr_i);
@@ -116,10 +99,10 @@ static inline int _is_full(ring_buffer_t *ring)
 static inline int _get_level(ring_buffer_t *ring)
 {
     if (ring->wr_i >= ring->rd_i) {
-        return ring->rd_i - ring->wr_i;
+        return ring->wr_i - ring->rd_i;
     }
     
-    return ring->wr_i + ring->maxsize - ring->rd_i;
+    return ring->maxsize - ring->rd_i + ring->wr_i;
 }
 
 
@@ -225,12 +208,13 @@ unsigned int ring_level(ring_buffer_t *ring)
  * @author diyi12
  * @date 2024-01-10
  */
-void ring_dev_init(ring_dev_t *dev, void *handle, unsigned char *txdata, unsigned int tsize, unsigned char *rxdata, unsigned int rsize)
+void ring_dev_init(ring_dev_t *dev, void *handle, void *txdata, unsigned int tsize, void *rxdata, unsigned int rsize)
 {
     ring_init(&dev->tx_ring, txdata, tsize);
     ring_init(&dev->rx_ring, rxdata, rsize);
     dev->handle = handle;
     dev->status = 0;
+    DEV_ENABLE_RXIT(((DEV_HANDLE_T *)handle));
 }
 
 
@@ -244,7 +228,7 @@ void ring_dev_init(ring_dev_t *dev, void *handle, unsigned char *txdata, unsigne
  * @author diyi12
  * @date 2024-01-10
  */
-unsigned int ring_dev_tx(ring_dev_t *dev, void *sdata, unsigned int size)
+unsigned int ring_dev_tx(ring_dev_t *dev, const void *sdata, unsigned int size)
 {
     unsigned int        sdsize = 0;
     const unsigned char *data = (unsigned char *)sdata;
@@ -254,11 +238,11 @@ unsigned int ring_dev_tx(ring_dev_t *dev, void *sdata, unsigned int size)
     */
     if (!(dev->status & DEV_STAT_TXIE)) {
         while (sdsize < size) {
-            if (IS_DEV_TXFIFO_FULL(dev->handle)) {
+            if (IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
                 break;
             }
             
-            DEV_WR_DR(dev->handle, data[sdsize]);
+            DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), data[sdsize]);
             sdsize++;
         }
         
@@ -297,14 +281,14 @@ unsigned int ring_dev_tx(ring_dev_t *dev, void *sdata, unsigned int size)
          * 如果打开发送中断后出现硬件FIFO已空但未触发中断，可尝试打开此处代码进行修复
          */
         unsigned char   tmp;
-        if (!IS_DEV_TXFIFO_FULL(dev->handle)) {
+        if (!IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
             ring_get(&dev->tx_ring, &tmp);
-            DEV_WR_DR(dev->handle, data[sdsize]);
+            DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), data[sdsize]);
         }
 #endif
         
         dev->status |= DEV_STAT_TXIE;
-        DEV_ENABLE_TXIT(dev->handle);
+        DEV_ENABLE_TXIT(((DEV_HANDLE_T *)(dev->handle)));
     }
     
     return sdsize;
@@ -341,7 +325,7 @@ unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
     /**
      * 接收缓存区已读空但数据量仍不够时关闭中断, 以轮询方式读取
     */
-    DEV_DISABLE_RXIT(dev->handle);
+    DEV_DISABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
     
     /**
      * 再读一次接收缓存区是为了处理以下情况:
@@ -359,10 +343,10 @@ unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
      * 此时若数据量还不够，则从硬件FIFO中直接读取
     */
     while (rvsize < size) {
-        if (IS_DEV_RXFIFO_EMPTY(dev->handle)) {
+        if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
             break;
         }
-        data[rvsize++] = DEV_RD_DR(dev->handle);
+        data[rvsize++] = DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle)));
     }
     
     /**
@@ -374,12 +358,12 @@ unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
          * 硬件FIFO读空后重新打开接收中断
          * 此处还有一个目的是保证开启中断时, 接收缓存一定有空间写入
         */
-        if (IS_DEV_RXFIFO_EMPTY(dev->handle)) {
-            DEV_ENABLE_RXIT(dev->handle);
+        if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
+            DEV_ENABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
             return rvsize;
         }
         
-        ring_put(&dev->rx_ring, DEV_RD_DR(dev->handle));
+        ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
     }
     
     return rvsize;
@@ -399,17 +383,17 @@ void ring_dev_rxInISR(ring_dev_t *dev)
      * 接收缓存未满时将数据写入接收缓存
     */
     while (ring_level(&dev->rx_ring)+1 < dev->rx_ring.maxsize) {
-        if (IS_DEV_RXFIFO_EMPTY(dev->handle)) {
+        if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
             return;
         }
         
-        ring_put(&dev->rx_ring, DEV_RD_DR(dev->handle));
+        ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
     }
     
     /**
      * 接收缓存已满时关闭中断
     */
-    DEV_DISABLE_RXIT(dev->handle);
+    DEV_DISABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
 }
 
 
@@ -432,14 +416,14 @@ void ring_dev_txInISR(ring_dev_t *dev)
         /**
          * 缓存区有数据但硬件FIFO已满时，直接退出本次写入
         */
-        if (IS_DEV_TXFIFO_FULL(dev->handle)) {
+        if (IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
             return;
         }
         
         ring_get(&dev->tx_ring, &data);
-        DEV_WR_DR(dev->handle, data);
+        DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), data);
     }
     
-    DEV_DISABLE_TXIT(dev->handle);
+    DEV_DISABLE_TXIT(((DEV_HANDLE_T *)(dev->handle)));
     dev->status &= ~DEV_STAT_TXIE;
 }
