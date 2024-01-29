@@ -69,6 +69,8 @@
 
 
 #define DEV_STAT_TXIE          (1U << 0)
+#define DEV_STAT_RXIE          (1U << 1)
+#define DEV_STAT_BUSY          (1U << 2)
 
 
 
@@ -81,28 +83,14 @@ static inline int _is_empty(ring_buffer_t *ring)
 
 static inline int _is_full(ring_buffer_t *ring)
 {
-    /* 队列已满的情况1: 写指针之后是读指针 */
-    if (ring->wr_i + 1 == ring->rd_i) {
-        return 1;
-    }
-    
-    /* 队列已满的情况2: 读指针在缓存区起始位置，写指针在缓冲区结束位置+1 */
-    if (ring->wr_i == ring->rd_i + ring->maxsize) {
-        return 1;
-    }
-    
-    return 0;
+    return ((ring->wr_i + 1) % ring->maxsize == ring->rd_i);
 }
 
 
 
 static inline int _get_level(ring_buffer_t *ring)
 {
-    if (ring->wr_i >= ring->rd_i) {
-        return ring->wr_i - ring->rd_i;
-    }
-    
-    return ring->maxsize - ring->rd_i + ring->wr_i;
+    return (ring->wr_i + ring->maxsize - ring->rd_i) % ring->maxsize;
 }
 
 
@@ -120,7 +108,7 @@ void ring_init(ring_buffer_t *ring, unsigned char *addr, unsigned int size)
     ring->data = addr;
     ring->rd_i = 0;
     ring->wr_i = 0;
-    ring->maxsize = size;
+    ring->maxsize = size>=1? size: 1;
 }
 
 
@@ -140,10 +128,8 @@ unsigned int ring_put(ring_buffer_t *ring, unsigned char data)
     }
     
     if (!_is_full(ring)) {
-        ring->data[ring->wr_i++] = data;
-        if (ring->wr_i >= ring->maxsize) {
-            ring->wr_i = 0;
-        }
+        ring->data[ring->wr_i] = data;
+        ring->wr_i = (ring->wr_i + 1) % ring->maxsize;
         return 1;
     }
     
@@ -167,10 +153,8 @@ unsigned int ring_get(ring_buffer_t *ring, unsigned char *data)
     }
     
     if (!_is_empty(ring)) {
-        *data = ring->data[ring->rd_i++];
-        if (ring->rd_i >= ring->maxsize) {
-            ring->rd_i = 0;
-        }
+        *data = ring->data[ring->rd_i];
+        ring->rd_i = (ring->rd_i + 1) % ring->maxsize;
         return 1;
     }
     
@@ -214,7 +198,11 @@ void ring_dev_init(ring_dev_t *dev, void *handle, void *txdata, unsigned int tsi
     ring_init(&dev->rx_ring, rxdata, rsize);
     dev->handle = handle;
     dev->status = 0;
-    DEV_ENABLE_RXIT(((DEV_HANDLE_T *)handle));
+    
+    if (rxdata && rsize>=2) {
+        dev->status = DEV_STAT_RXIE;
+        DEV_ENABLE_RXIT(((DEV_HANDLE_T *)handle));
+    }
 }
 
 
@@ -237,17 +225,13 @@ unsigned int ring_dev_tx(ring_dev_t *dev, const void *sdata, unsigned int size)
      * 没有打开发送中断时，优先使用硬件FIFO发送数据
     */
     if (!(dev->status & DEV_STAT_TXIE)) {
-        while (sdsize < size) {
-            if (IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
-                break;
+        while (!IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
+            if (sdsize >= size) {
+                return sdsize;
             }
             
             DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), data[sdsize]);
             sdsize++;
-        }
-        
-        if (sdsize >= size) {
-            return sdsize;
         }
     }
     
@@ -272,7 +256,7 @@ unsigned int ring_dev_tx(ring_dev_t *dev, const void *sdata, unsigned int size)
         /** 
          * 通过发送中断发送缓存区中的数据，若缓存区无数据也就没有开中断的必要
          */
-        if (ring_level(&dev->tx_ring) < 1) {
+        if (!(dev->tx_ring.data) || _is_empty(&dev->tx_ring)) {
             return sdsize;
         }
         
@@ -297,8 +281,8 @@ unsigned int ring_dev_tx(ring_dev_t *dev, const void *sdata, unsigned int size)
 
 
 /**
- * @brief 设备接收数据, 接收缓存中的数据不够时会关闭中断并以轮询方式读取硬件FIFO, 然后
- *          重新打开中断。注意, 当读取完指定的字节数后缓存仍为满时不会打开中断
+ * @brief 设备接收数据, 读取缓存期间若触发接收中断，则接收中断会被关闭，当
+ *        读取结束且缓存未满时再打开接收中断
  * 
  * @param dev 句柄
  * @param rdata 存放数据的起始地址
@@ -313,57 +297,48 @@ unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
     unsigned char   *data = (unsigned char *)rdata;
     
     /**
-     * 优先从接收缓存区中读取数据
-    */
-    while (rvsize < size) {
-        if (ring_get(&dev->rx_ring, data+rvsize) < 1) {
-            break;
-        }
-        rvsize++;
-    }
+     * 阻止中断向缓存中写数据
+     */
+    dev->status |= DEV_STAT_BUSY;
     
     /**
-     * 接收缓存区已读空但数据量仍不够时关闭中断, 以轮询方式读取
+     * 将硬件FIFO中的数据写入缓存
     */
-    DEV_DISABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
-    
-    /**
-     * 再读一次接收缓存区是为了处理以下情况:
-     * 若在关闭中断前又进入了中断，由于接收中断会将硬件FIFO中的数据全部写入接收缓存，所以
-     * 此处需要再次读取，确保数据读取顺序正确
-    */
-    while (rvsize < size) {
-        if (ring_get(&dev->rx_ring, data+rvsize) < 1) {
-            break;
-        }
-        rvsize++;
-    }
-    
-    /**
-     * 此时若数据量还不够，则从硬件FIFO中直接读取
-    */
-    while (rvsize < size) {
+    while (dev->rx_ring.data && !_is_full(&dev->rx_ring)) {
         if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
             break;
         }
-        data[rvsize++] = DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle)));
-    }
-    
-    /**
-     * 接收缓存未满时, 将硬件FIFO中剩余的数据写入接收缓存
-    */
-    while (ring_level(&dev->rx_ring)+1 < dev->rx_ring.maxsize) {
-        
-        /**
-         * 硬件FIFO读空后重新打开接收中断
-         * 此处还有一个目的是保证开启中断时, 接收缓存一定有空间写入
-        */
-        if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
-            DEV_ENABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
-            return rvsize;
-        }
-        
         ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
+    }
+    
+    /**
+     * 读取数据
+    */
+    while (rvsize < size) {
+        if (dev->rx_ring.data && !_is_empty(&dev->rx_ring)) {
+            ring_get(&dev->rx_ring, data+rvsize);
+            rvsize++;
+            if (!IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
+                ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
+            }
+        }
+        else {
+            if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
+                break;
+            }
+            
+            data[rvsize++] = DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle)));
+        }
+    }
+    
+    /**
+     * 允许中断向缓存中写数据
+    */
+    dev->status &= ~DEV_STAT_BUSY;
+    if ((dev->rx_ring.data && !_is_full(&dev->rx_ring)) && \
+        !(dev->status & DEV_STAT_RXIE)) {
+        dev->status |= DEV_STAT_RXIE;
+        DEV_ENABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
     }
     
     return rvsize;
@@ -372,7 +347,7 @@ unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
 
 
 /**
- * @brief 中断里的接收实现, 读取数据并写入接收缓存, 当接收缓存已满时会关闭中断
+ * @brief 中断里的接收实现, 读取数据并写入接收缓存
  * @param dev 
  * @author diyi12
  * @date 2024-01-10
@@ -380,20 +355,26 @@ unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
 void ring_dev_rxInISR(ring_dev_t *dev)
 {
     /**
-     * 接收缓存未满时将数据写入接收缓存
+     * 触发中断时已经在读取，则不需要由中断将数据写入缓存
     */
-    while (ring_level(&dev->rx_ring)+1 < dev->rx_ring.maxsize) {
-        if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
-            return;
-        }
-        
-        ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
+    if (dev->status & DEV_STAT_BUSY) {
+        DEV_DISABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
+        dev->status &= ~DEV_STAT_RXIE;
+        return;
     }
     
     /**
-     * 接收缓存已满时关闭中断
+     * 接收缓存未满时将数据写入接收缓存
     */
+    while (dev->rx_ring.data && !_is_full(&dev->rx_ring)) {
+        if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
+            return;
+        }
+        ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
+    }
+    
     DEV_DISABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
+    dev->status &= ~DEV_STAT_RXIE;
 }
 
 
@@ -411,7 +392,7 @@ void ring_dev_txInISR(ring_dev_t *dev)
     /**
      * 取出缓存区所有数据后关闭发送中断
     */
-    while (ring_level(&dev->tx_ring) > 0) {
+    while (dev->tx_ring.data && !_is_empty(&dev->tx_ring)) {
         
         /**
          * 缓存区有数据但硬件FIFO已满时，直接退出本次写入

@@ -11,7 +11,7 @@ typedef struct {
 } ring_buffer_t;
 
 
-typedef struct _ring_dev_t {
+typedef struct {
     ring_buffer_t   tx_ring;
     ring_buffer_t   rx_ring;
     unsigned int    status;
