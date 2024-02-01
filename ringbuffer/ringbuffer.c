@@ -68,9 +68,14 @@
 #endif
 
 
+
+/**
+ * @brief ring_dev_t@status
+ */
 #define DEV_STAT_TXIE          (1U << 0)
 #define DEV_STAT_RXIE          (1U << 1)
-#define DEV_STAT_BUSY          (1U << 2)
+#define DEV_STAT_TBSY          (1U << 2)
+#define DEV_STAT_RBSY          (1U << 3)
 
 
 
@@ -100,8 +105,6 @@ static inline int _get_level(ring_buffer_t *ring)
  * @param ring ringbuffer地址
  * @param addr 数据缓存区起始地址
  * @param size 缓存区大小，单位字节
- * @author diyi12
- * @date 2024-01-10
  */
 void ring_init(ring_buffer_t *ring, unsigned char *addr, unsigned int size)
 {
@@ -118,8 +121,6 @@ void ring_init(ring_buffer_t *ring, unsigned char *addr, unsigned int size)
  * @param ring 句柄
  * @param data 写入数据
  * @return unsigned int 成功返回1，失败返回0
- * @author diyi12
- * @date 2024-01-10
  */
 unsigned int ring_put(ring_buffer_t *ring, unsigned char data)
 {
@@ -143,8 +144,6 @@ unsigned int ring_put(ring_buffer_t *ring, unsigned char data)
  * @param ring 句柄
  * @param data 存放数据的地址
  * @return unsigned int 成功返回1，失败返回0
- * @author diyi12
- * @date 2024-01-10
  */
 unsigned int ring_get(ring_buffer_t *ring, unsigned char *data)
 {
@@ -167,8 +166,6 @@ unsigned int ring_get(ring_buffer_t *ring, unsigned char *data)
  * @brief 获取当前ringbuffer中元素的个数
  * @param ring 句柄
  * @return unsigned int 返回ringbuffer中元素的个数
- * @author diyi12
- * @date 2024-01-10
  */
 unsigned int ring_level(ring_buffer_t *ring)
 {
@@ -189,8 +186,6 @@ unsigned int ring_level(ring_buffer_t *ring)
  * @param tsize 发送缓存区大小(byte), 实际的最大深度为tsize-1, 当tisze<2时, 发送实现变为轮询
  * @param rxdata 接收缓存区, 可以为NULL, 此时接收实现变为轮询
  * @param rsize 接收缓存区大小(byte), 实际的最大深度为rsize-1, 当risze<2时, 接收实现变为轮询
- * @author diyi12
- * @date 2024-01-10
  */
 void ring_dev_init(ring_dev_t *dev, void *handle, void *txdata, unsigned int tsize, void *rxdata, unsigned int rsize)
 {
@@ -208,71 +203,63 @@ void ring_dev_init(ring_dev_t *dev, void *handle, void *txdata, unsigned int tsi
 
 
 /**
- * @brief 设备发送数据, 优先以轮询方式发送, 当硬件FIFO已满打开发送中断进行发送
+ * @brief 设备发送数据, 接口以轮询方式发送数据，当发送FIFO有数据但执行位置不在此接口内时以中断方式发送
  * @param dev 句柄
  * @param sdata 要发送的数据
  * @param size 数据大小(byte)
- * @return unsigned int 返回成功发送地字节数
- * @author diyi12
- * @date 2024-01-10
+ * @return unsigned int 返回成功发送的字节数
  */
 unsigned int ring_dev_tx(ring_dev_t *dev, const void *sdata, unsigned int size)
 {
     unsigned int        sdsize = 0;
     const unsigned char *data = (unsigned char *)sdata;
+    unsigned char       tmp, sendingflag=0;
     
-    /**
-     * 没有打开发送中断时，优先使用硬件FIFO发送数据
-    */
-    if (!(dev->status & DEV_STAT_TXIE)) {
-        while (!IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
-            if (sdsize >= size) {
-                return sdsize;
-            }
-            
-            DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), data[sdsize]);
-            sdsize++;
-        }
+    /* 阻止中断发送 */
+    if (dev->status & DEV_STAT_TBSY) {
+        sendingflag = 1;    //此处是为了避免中断里的此接口打断该接口的执行时清除掉BUSY标志
+    } else {
+        dev->status |= DEV_STAT_TBSY;
     }
     
     /**
-     * 硬件FIFO已填满但数据没写完时，剩余数据写入缓存区
+     * 发送数据：
+     * 所有FIFO都写满时直接退出
+     * 硬件FIFO有空位且软件FIFO不为空时，从软件FIFO中取出数据并填入硬件FIFO，再向软件FIFO中追加数据
+     * 硬件FIFO有空位且软件FIFO为空时，直接将发送数据填入硬件FIFO
+     * 硬件FIFO写满但软件FIFO有空位时，发送数据填入软件FIFO
     */
     while (sdsize < size) {
-        if (ring_put(&dev->tx_ring, data[sdsize]) < 1) {
+        if ((!dev->tx_ring.data || _is_full(&dev->tx_ring)) &&\
+            IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
             break;
         }
-        sdsize++;
+        
+        if (!IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
+            if (dev->tx_ring.data && !_is_empty(&dev->tx_ring)) {
+                ring_get(&dev->tx_ring, &tmp);
+                DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), tmp);
+                ring_put(&dev->tx_ring, data[sdsize++]);
+            } else {
+                DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), data[sdsize++]);
+            }
+            continue;
+        }
+        
+        if (dev->tx_ring.data) {
+            ring_put(&dev->tx_ring, data[sdsize++]);
+        }
     }
     
-    /** 
-     * 此处再次判断发送中断使能状态是为了处理以下情况:
-     * 若在写入发送缓存期间进入发送中断，由于发送中断读空发送缓存后会关闭发送中断，导致
-     * 退出中断后写入缓存的数据不会被中断读取并发送，所以此处需要再次判断是否打开了发送
-     * 中断
-     */
-    if (!(dev->status & DEV_STAT_TXIE)) {
+    /* 允许中断发送 */
+    if (!sendingflag) {
+        dev->status &= ~DEV_STAT_TBSY;
         
-        /** 
-         * 通过发送中断发送缓存区中的数据，若缓存区无数据也就没有开中断的必要
-         */
-        if (!(dev->tx_ring.data) || _is_empty(&dev->tx_ring)) {
-            return sdsize;
+        /* 发送中断未使能且软件fifo不为空时，打开发送中断 */
+        if ((dev->tx_ring.data && !_is_empty(&dev->tx_ring)) && !(dev->status & DEV_STAT_TXIE)) {
+            dev->status |= DEV_STAT_TXIE;
+            DEV_ENABLE_TXIT(((DEV_HANDLE_T *)(dev->handle)));
         }
-        
-#if 0
-        /**
-         * 如果打开发送中断后出现硬件FIFO已空但未触发中断，可尝试打开此处代码进行修复
-         */
-        unsigned char   tmp;
-        if (!IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
-            ring_get(&dev->tx_ring, &tmp);
-            DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), data[sdsize]);
-        }
-#endif
-        
-        dev->status |= DEV_STAT_TXIE;
-        DEV_ENABLE_TXIT(((DEV_HANDLE_T *)(dev->handle)));
     }
     
     return sdsize;
@@ -281,64 +268,57 @@ unsigned int ring_dev_tx(ring_dev_t *dev, const void *sdata, unsigned int size)
 
 
 /**
- * @brief 设备接收数据, 读取缓存期间若触发接收中断，则接收中断会被关闭，当
- *        读取结束且缓存未满时再打开接收中断
- * 
+ * @brief 设备接收数据, 接口以轮询方式接收数据，当执行位置不在此接口内但有数据被发送过来时以中断方式接收
  * @param dev 句柄
  * @param rdata 存放数据的起始地址
  * @param size 需要接收的数据大小(byte)
  * @return unsigned int 返回成功接收的字节数
- * @author diyi12
- * @date 2024-01-10
  */
 unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
 {
     unsigned int    rvsize = 0;
     unsigned char   *data = (unsigned char *)rdata;
+    unsigned char   recvingflag = 0;
     
-    /**
-     * 阻止中断向缓存中写数据
-     */
-    dev->status |= DEV_STAT_BUSY;
-    
-    /**
-     * 将硬件FIFO中的数据写入缓存
-    */
-    while (dev->rx_ring.data && !_is_full(&dev->rx_ring)) {
-        if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
-            break;
-        }
-        ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
+    /* 阻止接收中断向缓存中写数据 */
+    if (dev->status & DEV_STAT_RBSY) {
+        recvingflag = 1;    //此处是为了避免中断里的此接口打断该接口的执行时清除掉BUSY标志
+    } else {
+        dev->status |= DEV_STAT_RBSY;
     }
     
     /**
      * 读取数据
-    */
+     * 所有fifo都为空时直接退出
+     * 软件fifo不为空时，读取软件fifo并将硬件fifo中的数据写入软件fifo
+     * 软件fifo为空或不存在时，读取硬件fifo
+     */
     while (rvsize < size) {
+        if ((!dev->rx_ring.data || _is_empty(&dev->rx_ring)) &&\
+            IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
+            break;
+        }
+        
         if (dev->rx_ring.data && !_is_empty(&dev->rx_ring)) {
-            ring_get(&dev->rx_ring, data+rvsize);
-            rvsize++;
+            ring_get(&dev->rx_ring, data + rvsize++);
             if (!IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
                 ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
             }
+            continue;
         }
-        else {
-            if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
-                break;
-            }
-            
-            data[rvsize++] = DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle)));
-        }
+        
+        data[rvsize++] = DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle)));
     }
     
-    /**
-     * 允许中断向缓存中写数据
-    */
-    dev->status &= ~DEV_STAT_BUSY;
-    if ((dev->rx_ring.data && !_is_full(&dev->rx_ring)) && \
-        !(dev->status & DEV_STAT_RXIE)) {
-        dev->status |= DEV_STAT_RXIE;
-        DEV_ENABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
+    /* 允许中断向缓存中写数据 */
+    if (!recvingflag) {
+        dev->status &= ~DEV_STAT_RBSY;
+        
+        /* 接收中断未使能且软件fifo有空位时，打开接收中断 */
+        if ((dev->rx_ring.data && !_is_full(&dev->rx_ring)) && !(dev->status & DEV_STAT_RXIE)) {
+            dev->status |= DEV_STAT_RXIE;
+            DEV_ENABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
+        }
     }
     
     return rvsize;
@@ -349,23 +329,17 @@ unsigned int ring_dev_rx(ring_dev_t *dev, void *rdata, unsigned int size)
 /**
  * @brief 中断里的接收实现, 读取数据并写入接收缓存
  * @param dev 
- * @author diyi12
- * @date 2024-01-10
  */
 void ring_dev_rxInISR(ring_dev_t *dev)
 {
-    /**
-     * 触发中断时已经在读取，则不需要由中断将数据写入缓存
-    */
-    if (dev->status & DEV_STAT_BUSY) {
+    /* 若触发中断时处于接收接口中，则不需要由中断将数据写入缓存 */
+    if (dev->status & DEV_STAT_RBSY) {
         DEV_DISABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
         dev->status &= ~DEV_STAT_RXIE;
         return;
     }
     
-    /**
-     * 接收缓存未满时将数据写入接收缓存
-    */
+    /* 接收缓存未满时将数据写入接收缓存 */
     while (dev->rx_ring.data && !_is_full(&dev->rx_ring)) {
         if (IS_DEV_RXFIFO_EMPTY(((DEV_HANDLE_T *)(dev->handle)))) {
             return;
@@ -373,6 +347,7 @@ void ring_dev_rxInISR(ring_dev_t *dev)
         ring_put(&dev->rx_ring, DEV_RD_DR(((DEV_HANDLE_T *)(dev->handle))));
     }
     
+    /* 软件FIFO无空位时关闭中断 */
     DEV_DISABLE_RXIT(((DEV_HANDLE_T *)(dev->handle)));
     dev->status &= ~DEV_STAT_RXIE;
 }
@@ -382,21 +357,22 @@ void ring_dev_rxInISR(ring_dev_t *dev)
 /**
  * @brief 中断里的发送实现, 从发送缓存中取出数据并发送, 当发送缓存为空时会关闭发送中断
  * @param dev 句柄
- * @author diyi12
- * @date 2024-01-10
  */
 void ring_dev_txInISR(ring_dev_t *dev)
 {
     unsigned char data;
     
-    /**
-     * 取出缓存区所有数据后关闭发送中断
-    */
+    /* 若触发中断时处于发送接口中，则不需要由中断进行发送 */
+    if (dev->status & DEV_STAT_TBSY) {
+        DEV_DISABLE_TXIT(((DEV_HANDLE_T *)(dev->handle)));
+        dev->status &= ~DEV_STAT_TXIE;
+        return;
+    }
+    
+    /* 取出缓存区所有数据后关闭发送中断 */
     while (dev->tx_ring.data && !_is_empty(&dev->tx_ring)) {
         
-        /**
-         * 缓存区有数据但硬件FIFO已满时，直接退出本次写入
-        */
+        /* 缓存区有数据但硬件FIFO已满时，直接退出本次写入 */
         if (IS_DEV_TXFIFO_FULL(((DEV_HANDLE_T *)(dev->handle)))) {
             return;
         }
@@ -405,6 +381,7 @@ void ring_dev_txInISR(ring_dev_t *dev)
         DEV_WR_DR(((DEV_HANDLE_T *)(dev->handle)), data);
     }
     
+    /* 软件FIFO已空时关闭中断 */
     DEV_DISABLE_TXIT(((DEV_HANDLE_T *)(dev->handle)));
     dev->status &= ~DEV_STAT_TXIE;
 }
